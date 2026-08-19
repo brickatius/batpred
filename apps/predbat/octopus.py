@@ -35,6 +35,10 @@ integration_context_header = "Ha-Integration-Context"
 DATE_STR_FORMAT = "%Y-%m-%d"
 DATE_TIME_STR_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
+# Sentinel distinguishing "attribute not present on the entity" from a genuinely empty list,
+# since both would otherwise look the same (falsy) to callers.
+_ATTRIBUTE_UNSET = object()
+
 # Night-rate window definitions: start time, end time, whether the window crosses midnight.
 # Keys: "eco7" (Economy 7), "go" (Octopus GO / generic day-night), "iog" (Intelligent GO TOU).
 OCTOPUS_NIGHT_RATE_WINDOWS = {
@@ -1094,10 +1098,15 @@ class OctopusAPI(ComponentBase):
                 self.set_arg("metric_standing_charge", self.get_entity_name("sensor", tariff + "_standing"))
         devices = self.get_intelligent_devices()
         if devices:
+            # Suspended devices (e.g. an old/decommissioned charger still linked to the Octopus
+            # account) aren't actively charging, so exclude them from the entity lists and from
+            # the num_cars count below - otherwise a stale suspended device can silently push
+            # num_cars past what Predbat actually supports (see fetch_config_options' clamp).
+            active_devices = {device_id: device for device_id, device in devices.items() if not device.get("suspended")}
             slot_list = []
             ready_list = []
             limit_list = []
-            for device_id in devices:
+            for device_id in active_devices:
                 index_suffix = self.device_id_to_index_suffix(device_id)
                 slot_list.append(self.get_entity_name("binary_sensor", "intelligent_dispatch", index=index_suffix))
                 ready_list.append(self.get_entity_name("select", "intelligent_target_time", index=index_suffix))
@@ -1105,10 +1114,10 @@ class OctopusAPI(ComponentBase):
             self.set_arg("octopus_intelligent_slot", slot_list)
             self.set_arg("octopus_ready_time", ready_list)
             self.set_arg("octopus_charge_limit", limit_list)
-            # Increase number of cars if we have more devices than the current limit to ensure all devices can be configured
+            # Increase number of cars if we have more active devices than the current limit to ensure all devices can be configured
             num_cars = self.get_arg("num_cars", 0)
-            if num_cars < len(devices):
-                self.set_arg("num_cars", len(devices))
+            if num_cars < len(active_devices):
+                self.set_arg("num_cars", len(active_devices))
 
     async def async_get_saving_sessions(self, account_id):
         """
@@ -2061,7 +2070,7 @@ class Octopus:
         Download octopus free session data directly from a URL, no caching.
         """
         try:
-            r = requests.get(url)
+            r = requests.get(url, timeout=120)
         except requests.exceptions.ConnectionError:
             self.log("Warn: Octopus: Unable to download Octopus data from URL {} (ConnectionError)".format(url))
             self.record_status("Warn: Unable to download Octopus free session data", debug=url, had_errors=True)
@@ -2565,19 +2574,40 @@ class Octopus:
                 kwh = remaining_minutes * self.car_charging_rate[car_n] / 60.0
                 start_minutes = self.minutes_now  # align span with the synthesised kwh so downstream rate calculations are consistent
             if kwh > 0:
-                # Don't add overlapping slots, bug in Octopus API means that sometimes slots overlap
+                # Don't add overlapping slots, bug in Octopus API means that sometimes slots overlap.
+                # Subtract every already-decoded slot's span from this slot's remaining segments -
+                # a slot can be trimmed at the start, trimmed at the end, removed entirely (it's
+                # fully covered by an existing slot), or - the case that was previously missing
+                # here (issue #4497) - it can fully CONTAIN an existing slot, which must split it
+                # into up to two remaining segments rather than just trimming one edge, or the
+                # whole future remainder silently disappears. This matters because fetch.py merges
+                # the HA Octopus Energy integration's completed_dispatches ahead of
+                # planned_dispatches: a short completed historical interval commonly sits inside a
+                # much longer still-active planned interval.
+                original_span = end_minutes - start_minutes
+                segments = [(start_minutes, end_minutes)]
                 for current_slot in slots_decoded:
                     current_start, current_end, current_kwh, current_source, current_location = current_slot
-                    if (start_minutes < current_end) and (end_minutes > current_start):
-                        if start_minutes < current_start:
-                            end_minutes = current_start
-                        elif end_minutes > current_end:
-                            start_minutes = current_end
+                    remaining = []
+                    for seg_start, seg_end in segments:
+                        if seg_start < current_end and seg_end > current_start:
+                            if seg_start < current_start:
+                                remaining.append((seg_start, current_start))
+                            if seg_end > current_end:
+                                remaining.append((current_end, seg_end))
                         else:
-                            start_minutes = end_minutes  # Remove slot
-                # Only add the slot if it has a non-zero duration
-                if start_minutes != end_minutes:
-                    slots_decoded.append((start_minutes, end_minutes, kwh, source, location))
+                            remaining.append((seg_start, seg_end))
+                    segments = remaining
+                # A single remaining segment (the common case: no overlap, or the previously-existing
+                # single-edge-trim behaviour) keeps its original full kwh unchanged. Only when the
+                # slot was actually split into multiple pieces is kwh scaled by each piece's share of
+                # the original span, so a genuine split never duplicates energy across the pieces.
+                split = len(segments) > 1
+                for seg_start, seg_end in segments:
+                    if seg_start == seg_end:
+                        continue
+                    seg_kwh = kwh * (seg_end - seg_start) / original_span if (split and original_span > 0) else kwh
+                    slots_decoded.append((seg_start, seg_end, seg_kwh, source, location))
 
         # Sort slots by start time
         slots_sorted = sorted(slots_decoded, key=lambda x: x[0])
@@ -2913,12 +2943,22 @@ class Octopus:
             entity_id = self.get_arg("octopus_saving_session", indirect=False)
             if entity_id:
                 state = self.get_arg("octopus_saving_session", False)
-                joined_events = self.get_state_wrapper(entity_id=entity_id, attribute="joined_events")
-                if not joined_events:
-                    entity_id = entity_id.replace("binary_sensor.", "event.").replace("_sessions", "_session_events")
-                    joined_events = self.get_state_wrapper(entity_id=entity_id, attribute="joined_events")
-
-                available_events = self.get_state_wrapper(entity_id=entity_id, attribute="available_events")
+                joined_events = self.get_state_wrapper(entity_id=entity_id, attribute="joined_events", default=_ATTRIBUTE_UNSET)
+                available_events = self.get_state_wrapper(entity_id=entity_id, attribute="available_events", default=_ATTRIBUTE_UNSET)
+                if joined_events is _ATTRIBUTE_UNSET and available_events is _ATTRIBUTE_UNSET:
+                    # Legacy binary_sensor entities carry neither attribute at all - fall back to the
+                    # newer event entity naming convention, but only adopt it if it actually has data.
+                    # A configured entity that has the attributes but with no events right now (empty
+                    # lists) is a valid state and must not trigger this fallback.
+                    fallback_entity_id = entity_id.replace("binary_sensor.", "event.").replace("_sessions", "_session_events")
+                    fallback_joined_events = self.get_state_wrapper(entity_id=fallback_entity_id, attribute="joined_events", default=_ATTRIBUTE_UNSET)
+                    fallback_available_events = self.get_state_wrapper(entity_id=fallback_entity_id, attribute="available_events", default=_ATTRIBUTE_UNSET)
+                    if fallback_joined_events is not _ATTRIBUTE_UNSET or fallback_available_events is not _ATTRIBUTE_UNSET:
+                        entity_id = fallback_entity_id
+                        joined_events = fallback_joined_events
+                        available_events = fallback_available_events
+                joined_events = [] if joined_events is _ATTRIBUTE_UNSET else joined_events
+                available_events = [] if available_events is _ATTRIBUTE_UNSET else available_events
 
             if available_events and not self.get_arg("octopus_saving_auto_join", True):
                 self.log("Octopus: Saving session auto-join is disabled, not joining available events")
